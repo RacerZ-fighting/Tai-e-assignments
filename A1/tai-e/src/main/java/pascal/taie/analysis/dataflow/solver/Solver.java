@@ -82,6 +82,19 @@ public abstract class Solver<Node, Fact> {
 
     protected void initializeBackward(CFG<Node> cfg, DataflowResult<Node, Fact> result) {
         // TODO - finish me
+        // boundary
+        Node exit = cfg.getExit();
+        result.setInFact(exit, analysis.newBoundaryFact(cfg));
+        result.setOutFact(exit, analysis.newBoundaryFact(cfg));
+        // initial
+        cfg.getNodes().forEach(entry -> {
+            // exit 已经初始化过
+            if (cfg.isExit(entry)) {
+                return;
+            }
+            result.setInFact(entry, analysis.newInitialFact());
+            result.setOutFact(entry, analysis.newInitialFact());
+        });
     }
 
     /**
