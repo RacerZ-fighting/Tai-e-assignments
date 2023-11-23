@@ -26,6 +26,7 @@ import pascal.taie.analysis.dataflow.fact.DataflowResult;
 import pascal.taie.analysis.graph.icfg.ICFG;
 import pascal.taie.util.collection.SetQueue;
 
+import java.util.ArrayDeque;
 import java.util.Queue;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -60,9 +61,43 @@ class InterSolver<Method, Node, Fact> {
 
     private void initialize() {
         // TODO - finish me
+        Set<Node> entryNodes = icfg.entryMethods()
+                .map(icfg::getEntryOf)  // 拿到所有入口方法的入口结点
+                .collect(Collectors.toSet());
+        entryNodes.forEach(entry -> {
+            result.setOutFact(entry, analysis.newBoundaryFact(entry));
+            result.setInFact(entry, analysis.newBoundaryFact(entry));
+        });
+
+        icfg.forEach(node -> {
+            if (!entryNodes.contains(node)) {
+                result.setInFact(node, analysis.newInitialFact());
+                result.setOutFact(node, analysis.newInitialFact());
+            }
+        });
     }
 
     private void doSolve() {
         // TODO - finish me
+        ArrayDeque<Node> workList = new ArrayDeque<>();
+        icfg.forEach(workList::add);
+
+        while (!workList.isEmpty()) {
+            Node node = workList.poll();
+            // 计算 IN 时，对所有前驱的 OUT 和 edge 作 edge transfer
+            Fact inFact = result.getInFact(node);
+            icfg.getInEdgesOf(node).forEach(inEdge -> {
+                // 先 edge transfer 再 meet
+                Fact outPredFact = result.getOutFact(inEdge.getSource());
+                analysis.meetInto(analysis.transferEdge(inEdge, outPredFact), inFact);
+            });
+
+            Fact outFact = result.getOutFact(node);
+            boolean changed;
+            changed = analysis.transferNode(node, inFact, outFact);
+            if (changed) {
+                workList.addAll(icfg.getSuccsOf(node));
+            }
+        }
     }
 }
