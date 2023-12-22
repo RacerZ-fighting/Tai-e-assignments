@@ -22,6 +22,7 @@
 
 package pascal.taie.analysis.pta.core.heap;
 
+import pascal.taie.analysis.pta.core.cs.element.CSObj;
 import pascal.taie.ir.exp.ReferenceLiteral;
 import pascal.taie.ir.stmt.New;
 
