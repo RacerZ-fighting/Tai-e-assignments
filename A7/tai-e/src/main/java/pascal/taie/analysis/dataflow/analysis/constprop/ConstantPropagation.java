@@ -22,24 +22,25 @@
 
 package pascal.taie.analysis.dataflow.analysis.constprop;
 
+import jas.Pair;
 import pascal.taie.analysis.dataflow.analysis.AbstractDataflowAnalysis;
 import pascal.taie.analysis.graph.cfg.CFG;
+import pascal.taie.analysis.pta.core.heap.Obj;
 import pascal.taie.config.AnalysisConfig;
-import pascal.taie.ir.IR;
-import pascal.taie.ir.exp.ArithmeticExp;
-import pascal.taie.ir.exp.BinaryExp;
-import pascal.taie.ir.exp.BitwiseExp;
-import pascal.taie.ir.exp.ConditionExp;
-import pascal.taie.ir.exp.Exp;
-import pascal.taie.ir.exp.IntLiteral;
-import pascal.taie.ir.exp.ShiftExp;
-import pascal.taie.ir.exp.Var;
+import pascal.taie.ir.exp.*;
+import pascal.taie.ir.proginfo.FieldRef;
 import pascal.taie.ir.stmt.DefinitionStmt;
 import pascal.taie.ir.stmt.Stmt;
+import pascal.taie.language.classes.JClass;
 import pascal.taie.language.type.PrimitiveType;
 import pascal.taie.language.type.Type;
 import pascal.taie.util.AnalysisException;
 
+import java.util.List;
+import java.util.Map;
+
+import static pascal.taie.analysis.dataflow.inter.InterConstantPropagation.pta;
+import static pascal.taie.analysis.dataflow.inter.InterConstantPropagation.valMap;
 public class ConstantPropagation extends
         AbstractDataflowAnalysis<Stmt, CPFact> {
 
@@ -57,32 +58,71 @@ public class ConstantPropagation extends
     @Override
     public CPFact newBoundaryFact(CFG<Stmt> cfg) {
         // TODO - finish me
-        return null;
+        CPFact mappings = new CPFact();
+        List<Var> params = cfg.getIR().getParams();
+        for (Var param : params) {
+            if (canHoldInt(param)) {
+                mappings.update(param, Value.getNAC());
+            }
+        }
+        return mappings;
     }
 
     @Override
     public CPFact newInitialFact() {
         // TODO - finish me
-        return null;
+        return new CPFact();
     }
 
     @Override
     public void meetInto(CPFact fact, CPFact target) {
         // TODO - finish me
+        fact.forEach(((var, value) -> {
+            target.update(var, meetValue(value, target.get(var)));
+        }));
     }
 
     /**
      * Meets two Values.
      */
-    public Value meetValue(Value v1, Value v2) {
+    public static Value meetValue(Value v1, Value v2) {
         // TODO - finish me
-        return null;
+        if (v1.isConstant() && v2.isUndef()) {
+            return v1;
+        } else if (v1.isUndef() && v2.isConstant()) {
+            return v2;
+        } else if (v1.isNAC() || v2.isNAC()) {
+            return Value.getNAC();
+        } else if (v1.equals(v2)) {
+            return v1;
+        } else {
+            return Value.getNAC();
+        }
     }
 
     @Override
     public boolean transferNode(Stmt stmt, CPFact in, CPFact out) {
         // TODO - finish me
-        return false;
+        if (stmt instanceof DefinitionStmt) {
+            LValue lValue = ((DefinitionStmt<?, ?>) stmt).getLValue();
+            if (lValue instanceof Var lhs) {
+                // 右式视为表达式
+                Exp rhs = ((DefinitionStmt<?, ?>) stmt).getRValue();
+                // gen U (IN[s] - {(x, _)})
+                boolean changed = false;
+                for (Var inVar : in.keySet()) {
+                    if (!lhs.equals(inVar)) {
+                        changed |= out.update(inVar, in.get(inVar));
+                    }
+                }
+                // 如果 lhs 不是规定范围类型内的变量，则忽略，因为它不会出现在 CPFact 当中 :)
+                return canHoldInt(lhs) ?
+                        out.update(lhs, evaluate(rhs, in)) || changed :
+                        changed;
+            }
+        }
+        // other cases: identical function
+        return out.copyFrom(in);
     }
 
     /**
@@ -112,6 +152,103 @@ public class ConstantPropagation extends
      */
     public static Value evaluate(Exp exp, CPFact in) {
         // TODO - finish me
-        return null;
+        if (exp instanceof IntLiteral) {    // 处理字面量
+            return Value.makeConstant(((IntLiteral) exp).getValue());
+        } else if (exp instanceof Var var) {    // 处理变量
+            return canHoldInt(var) ? in.get(var) : Value.getNAC();
+        } else if (exp instanceof BinaryExp binaryExp) {
+            BinaryExp.Op op = binaryExp.getOperator();
+            // 精妙之处：套用 evaluate 来获得操作数的值
+            Value var1 = evaluate(binaryExp.getOperand1(), in);
+            Value var2 = evaluate(binaryExp.getOperand2(), in);
+            // 处理除 0 错误：var1 不论是否为常数，都会返回 UDF :(
+            if ((op == ArithmeticExp.Op.DIV || op == ArithmeticExp.Op.REM) &&
+                    var2.isConstant() && var2.getConstant() == 0) {
+                return Value.getUndef();
+            }
+            // val(y) op val(z)
+            if (var1.isConstant() && var2.isConstant()) {
+                // 函数重载调用
+                return Value.makeConstant(evaluate(op, var1.getConstant(), var2.getConstant()));
+            }
+            // if val(y) or val(z) is NAC
+            if (var1.isNAC() || var2.isNAC()) {
+                return Value.getNAC();
+            }
+            // otherwise
+            return Value.getUndef();
+        } else if (exp instanceof ArrayAccess arrayAccess) {    // load -> store -> rhs Value
+            Var base = arrayAccess.getBase();
+            Value index = evaluate(arrayAccess.getIndex(), in);
+            Value val = Value.getUndef();
+            if (index.isConstant()) {
+                for (Obj obj : pta.getPointsToSet(base)) {
+                    val = meetValue(valMap.getOrDefault(new Pair<>(obj, Value.makeConstant(index.getConstant())), Value.getUndef()), val);
+                    val = meetValue(valMap.getOrDefault(new Pair<>(obj, Value.getNAC()), Value.getUndef()), val);
+                }
+            } else if (index.isNAC()) {
+                for (Obj obj : pta.getPointsToSet(base)) {
+                    // 需要 meet 所有 obj 中的实例指向值
+                    for (Map.Entry<Pair<?, ?>, Value> entry : valMap.entrySet()) {
+                        Pair<?, ?> key = entry.getKey();
+                        if (key.getO1().equals(obj) && key.getO2() instanceof Value) {
+                            val = meetValue(val, entry.getValue());
+                        }
+                    }
+                }
+            }
+            return val;
+        } else if (exp instanceof InstanceFieldAccess instanceFieldAccess) {
+            Var base = instanceFieldAccess.getBase();
+            FieldRef fieldRef = instanceFieldAccess.getFieldRef();
+            Value val = Value.getUndef();
+            for (Obj obj : pta.getPointsToSet(base)) {
+                Pair<Obj, FieldRef> key = new Pair<>(obj, fieldRef);
+                val = meetValue(val, valMap.getOrDefault(key, Value.getUndef()));
+            }
+            return val;
+        } else if (exp instanceof StaticFieldAccess staticFieldAccess) {
+            FieldRef fieldRef = staticFieldAccess.getFieldRef();
+            JClass aClass = fieldRef.getDeclaringClass();
+            Value val = Value.getUndef();
+            val = meetValue(val, valMap.getOrDefault(new Pair<>(aClass, fieldRef), Value.getUndef()));
+            return val;
+        }
+        // other cases: safe approximation
+        return Value.getNAC();
+    }
+
+    public static int evaluate(BinaryExp.Op op, int i1, int i2) {
+        if (op instanceof ArithmeticExp.Op) {
+            return switch ((ArithmeticExp.Op) op) {
+                case ADD -> i1 + i2;
+                case DIV -> i1 / i2;
+                case MUL -> i1 * i2;
+                case SUB -> i1 - i2;
+                case REM -> i1 % i2;
+            };
+        } else if (op instanceof ConditionExp.Op) {
+            return switch ((ConditionExp.Op) op) {
+                case EQ -> i1 == i2 ? 1 : 0;
+                case GE -> i1 >= i2 ? 1 : 0;
+                case GT -> i1 > i2 ? 1 : 0;
+                case LE -> i1 <= i2 ? 1 : 0;
+                case LT -> i1 < i2 ? 1 : 0;
+                case NE -> i1 != i2 ? 1 : 0;
+            };
+        } else if (op instanceof ShiftExp.Op) {
+            return switch ((ShiftExp.Op) op) {
+                case SHL -> i1 << i2;
+                case SHR -> i1 >> i2;
+                case USHR -> i1 >>> i2;
+            };
+        } else if (op instanceof BitwiseExp.Op) {
+            return switch ((BitwiseExp.Op) op) {
+                case OR -> i1 | i2;
+                case AND -> i1 & i2;
+                case XOR -> i1 ^ i2;
+            };
+        }
+        throw new AnalysisException("Unsupported operator: " + op);
     }
 }
