@@ -27,12 +27,17 @@ import org.apache.logging.log4j.Logger;
 import pascal.taie.World;
 import pascal.taie.analysis.pta.PointerAnalysisResult;
 import pascal.taie.analysis.pta.core.cs.context.Context;
+import pascal.taie.analysis.pta.core.cs.element.CSCallSite;
 import pascal.taie.analysis.pta.core.cs.element.CSManager;
+import pascal.taie.analysis.pta.core.cs.element.CSVar;
+import pascal.taie.analysis.pta.core.heap.Obj;
 import pascal.taie.analysis.pta.cs.Solver;
+import pascal.taie.ir.exp.Var;
+import pascal.taie.ir.stmt.Invoke;
+import pascal.taie.language.classes.JMethod;
+import pascal.taie.language.type.Type;
 
-import java.util.Map;
-import java.util.Set;
-import java.util.TreeSet;
+import java.util.*;
 
 public class TaintAnalysiss {
 
@@ -48,6 +53,8 @@ public class TaintAnalysiss {
 
     private final Context emptyContext;
 
+    public final HashMap<JMethod, Set<CSCallSite>> csSinks;
+
     public TaintAnalysiss(Solver solver) {
         manager = new TaintManager();
         this.solver = solver;
@@ -57,10 +64,38 @@ public class TaintAnalysiss {
                 solver.getOptions().getString("taint-config"),
                 World.get().getClassHierarchy(),
                 World.get().getTypeSystem());
+        csSinks = new HashMap<>();
         logger.info(config);
     }
 
     // TODO - finish me
+    public boolean isSource(JMethod method, Type type) {
+        return config.getSources().contains(new Source(method, type));
+    }
+
+    public boolean isSink(JMethod method, int index) {
+        return config.getSinks().contains(new Sink(method, index));
+    }
+
+    public boolean isTaintTransfer(JMethod method, String from, String to, Type type) {
+        return config.getTransfers().contains(
+                new TaintTransfer(method, TaintTransfer.toInt(from),
+                        TaintTransfer.toInt(to), type));
+    }
+
+    public void addSink(JMethod sink, CSCallSite csCallSite) {
+        Set<CSCallSite> siteSet = csSinks.getOrDefault(sink, new HashSet<>());
+        siteSet.add(csCallSite);
+        csSinks.put(sink, siteSet);
+    }
+
+    public Obj makeTaint(Invoke source, Type type) {
+        return manager.makeTaint(source, type);
+    }
+
+    public boolean isTaint(Obj obj) {
+        return manager.isTaint(obj);
+    }
 
     public void onFinish() {
         Set<TaintFlow> taintFlows = collectTaintFlows();
@@ -72,6 +107,27 @@ public class TaintAnalysiss {
         PointerAnalysisResult result = solver.getResult();
         // TODO - finish me
         // You could query pointer analysis results you need via variable result.
+        config.getSinks().forEach(sink -> {
+            JMethod method = sink.method();
+            int index = sink.index();
+
+            Set<CSCallSite> csCallSites = csSinks.get(method);
+            // 需要获得指定 sink 方法在 call graph 上的所有调用点
+            if (csCallSites != null) {
+                csCallSites.forEach(csCallSite -> {
+                    // c:ai
+                    Var arg = csCallSite.getCallSite().getInvokeExp().getArg(index);
+                    CSVar csArg = csManager.getCSVar(csCallSite.getContext(), arg);
+                    result.getPointsToSet(csArg).forEach(csObj -> {
+                        if (manager.isTaint(csObj.getObject())) {
+                            Invoke sourceCall = manager.getSourceCall(csObj.getObject());
+                            taintFlows.add(new TaintFlow(sourceCall, csCallSite.getCallSite(), index));
+                        }
+                    });
+                });
+            }
+        });
+
         return taintFlows;
     }
 }
